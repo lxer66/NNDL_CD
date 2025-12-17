@@ -1,6 +1,7 @@
 """
-DINOv2-Base + MLP Connector + T5-Small with LoRA
+DINOv2-Base + SwiGLU MLP Connector + Flan-T5-Base with LoRA
 核心模型架构,实现防盲/防泄露策略
+使用 Pre-Norm SwiGLU 和 Encoder Injection 方法
 """
 
 import torch
@@ -23,14 +24,18 @@ from config import (
     DINO_HIDDEN_SIZE,
     T5_HIDDEN_SIZE,
     MLP_HIDDEN_SIZE,
-    IMAGE_SIZE  # <--- 添加这一行
+    IMAGE_SIZE,
+    VCBDR_WEIGHT
 )
 
+from loss import VC_BDR_Loss
 
-class MLPConnector(nn.Module):
+
+class SwiGLUConnector(nn.Module):
     """
-    MLP Connector: 将 DINOv2 视觉特征映射到 T5 输入空间
-    架构: Linear(768 -> 2048) -> GELU -> Linear(2048 -> 512)
+    SwiGLU MLP Connector with Pre-Norm
+    Architecture: LayerNorm -> SwiGLU(768 -> 2048 -> 768)
+    SwiGLU: output = W3(SiLU(W1(x)) * W2(x))
     """
     
     def __init__(
@@ -41,44 +46,57 @@ class MLPConnector(nn.Module):
     ):
         super().__init__()
         
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, output_dim)
-        )
+        # Pre-Norm: Stabilize DINOv2 features
+        self.norm = nn.LayerNorm(input_dim)
         
-        # Xavier 初始化 (重要!)
+        # SwiGLU Components
+        self.w1 = nn.Linear(input_dim, hidden_dim, bias=False)   # Gate
+        self.w2 = nn.Linear(input_dim, hidden_dim, bias=False)   # Value
+        self.w3 = nn.Linear(hidden_dim, output_dim, bias=False)  # Output
+        
+        # Activation
+        self.act = nn.SiLU()  # Swish activation
+        
+        # Xavier Uniform Initialization
         self._init_weights()
     
     def _init_weights(self):
-        """使用 Xavier Uniform 初始化"""
-        for module in self.mlp:
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+        """Apply Xavier Uniform initialization to all linear layers"""
+        nn.init.xavier_uniform_(self.w1.weight)
+        nn.init.xavier_uniform_(self.w2.weight)
+        nn.init.xavier_uniform_(self.w3.weight)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: [batch_size, seq_len, 768] - DINOv2 输出
+            x: [batch_size, seq_len, 768] - DINOv2 output
         Returns:
-            [batch_size, seq_len, 512] - T5 输入
+            [batch_size, seq_len, 768] - T5-Base input
         """
-        return self.mlp(x)
+        # Pre-Norm
+        x_norm = self.norm(x)
+        
+        # SwiGLU: W3(SiLU(W1(x)) * W2(x))
+        gate = self.act(self.w1(x_norm))    # [B, L, 2048]
+        value = self.w2(x_norm)              # [B, L, 2048]
+        hidden = gate * value                # Element-wise product
+        output = self.w3(hidden)             # [B, L, 768]
+        
+        return output
 
 
 class DinoT5LoRAModel(nn.Module):
     """
     完整的图像描述生成模型
-    架构: DINOv2 (LoRA) -> MLP -> T5 (LoRA)
+    架构: DINOv2 (LoRA) -> SwiGLU Connector -> Flan-T5-Base (LoRA)
+    使用 Encoder Injection 方法防止信息泄露
     """
     
     def __init__(self, use_gradient_checkpointing: bool = True):
         super().__init__()
         
         print("=" * 60)
-        print("Initializing DinoT5LoRAModel")
+        print("Initializing DinoT5LoRAModel (Flan-T5-Base)")
         print("=" * 60)
         
         # 1. 加载 DINOv2 Vision Encoder
@@ -108,13 +126,13 @@ class DinoT5LoRAModel(nn.Module):
         print(f"  ✓ DINOv2 loaded with LoRA (r={LORA_R})")
         self.vision_model.print_trainable_parameters()
         
-        # 2. 构建 MLP Connector
-        print("\n[2/3] Building MLP Connector...")
-        self.connector = MLPConnector()
-        print(f"  ✓ MLP: {DINO_HIDDEN_SIZE} -> {MLP_HIDDEN_SIZE} -> {T5_HIDDEN_SIZE}")
+        # 2. 构建 SwiGLU Connector
+        print("\n[2/3] Building SwiGLU Connector...")
+        self.connector = SwiGLUConnector()
+        print(f"  ✓ SwiGLU: {DINO_HIDDEN_SIZE} -> {MLP_HIDDEN_SIZE} -> {T5_HIDDEN_SIZE}")
         
-        # 3. 加载 T5 Language Model
-        print("\n[3/3] Loading T5-Small...")
+        # 3. 加载 Flan-T5-Base Language Model
+        print("\n[3/3] Loading Flan-T5-Base...")
         self.t5_model = T5ForConditionalGeneration.from_pretrained(
             TEXT_MODEL_PATH
         )
@@ -134,62 +152,108 @@ class DinoT5LoRAModel(nn.Module):
         )
         self.t5_model = get_peft_model(self.t5_model, text_lora_config)
         
-        print(f"  ✓ T5 loaded with LoRA (r={LORA_R})")
+        # 开启梯度检查点 (T5 部分)
+        if use_gradient_checkpointing:
+            self.t5_model.gradient_checkpointing_enable()
+        
+        print(f"  ✓ Flan-T5-Base loaded with LoRA (r={LORA_R})")
         self.t5_model.print_trainable_parameters()
+        
+        # 4. 初始化 VC-BDR Loss
+        self.vcbdr_loss_fn = VC_BDR_Loss(temperature=0.07)
         
         print("\n" + "=" * 60)
         print("✓ Model initialization complete")
+        print("  Architecture: DINOv2-Base -> SwiGLU -> Flan-T5-Base")
+        print("  VC-BDR Loss: Enabled")
         print("=" * 60)
     
     def forward(
         self,
         pixel_values: torch.Tensor,
-        labels: torch.Tensor
+        labels: torch.Tensor,
+        use_vcbdr: bool = False
     ) -> dict:
         """
-        前向传播 - 关键防泄露逻辑
+        前向传播 - 使用 Encoder Injection 方法防止信息泄露
+        支持 VC-BDR 辅助损失
         
         Args:
             pixel_values: [batch_size, 3, 518, 518]
             labels: [batch_size, max_length] - 目标文本,padding位置为-100
+            use_vcbdr: 是否启用 VC-BDR 损失
         
         Returns:
             dict: {
-                'loss': torch.Tensor,
+                'loss': torch.Tensor - 总损失 (主损失 + VC-BDR)
+                'main_loss': torch.Tensor - 主任务损失
+                'aux_loss': torch.Tensor - VC-BDR 辅助损失 (如果启用)
                 'logits': torch.Tensor,
                 'vision_features': torch.Tensor (可选)
             }
         """
         batch_size = pixel_values.shape[0]
         
-        # 1. 提取视觉特征 - 关键修正: 使用关键字参数
+        # 1. 提取视觉特征 - DINOv2 Encoder
         vision_outputs = self.vision_model(pixel_values=pixel_values)
         last_hidden_state = vision_outputs.last_hidden_state
-        # Shape: [batch_size, 1369, 768] (37*37=1369 patches)
+        # Shape: [batch_size, 1369, 768] (37*37=1369 patches for 518px)
         
-        # 2. 通过 MLP 映射到 T5 输入空间
+        # 2. 通过 SwiGLU Connector 映射到 T5 输入空间
         inputs_embeds = self.connector(last_hidden_state)
-        # Shape: [batch_size, 1369, 512]
+        # Shape: [batch_size, 1369, 768]
         
-        # 3. 防泄露关键步骤: 显式构造 decoder_input_ids
-        # 从 labels 生成 decoder 输入 (shifted right)
+        # 3. 关键防泄露步骤: 显式构造 decoder_input_ids
+        # 从 labels 生成 decoder 输入 (shifted right for teacher forcing)
         decoder_input_ids = self.t5_model.prepare_decoder_input_ids_from_labels(
             labels=labels
         )
         
-        # 4. 调用 T5 (使用 inputs_embeds 而非 input_ids)
+        # 4. Encoder Injection: 调用 T5 with inputs_embeds
+        # inputs_embeds 会激活 T5 Encoder 栈处理视觉特征
+        # decoder_input_ids 确保正确的 teacher forcing
         outputs = self.t5_model(
-            inputs_embeds=inputs_embeds,           # 视觉特征作为 encoder 输入
-            decoder_input_ids=decoder_input_ids,   # 显式 decoder 输入
+            inputs_embeds=inputs_embeds,           # 视觉特征注入 T5 Encoder
+            decoder_input_ids=decoder_input_ids,   # 显式 Decoder 输入
             labels=labels,                         # 用于计算损失
+            output_hidden_states=use_vcbdr,        # 仅在需要时输出隐藏状态
             return_dict=True
         )
         
-        return {
-            'loss': outputs.loss,
+        # 主任务损失 (CrossEntropy)
+        main_loss = outputs.loss
+        
+        result = {
+            'main_loss': main_loss,
             'logits': outputs.logits,
-            'vision_features': last_hidden_state  # 可选,用于可视化
+            'vision_features': last_hidden_state
         }
+        
+        # 5. 计算 VC-BDR 辅助损失 (如果启用)
+        if use_vcbdr:
+            # 获取 decoder 最后一层隐藏状态
+            decoder_hidden_states = outputs.decoder_hidden_states[-1]  # [B, seq_len, 768]
+            
+            # 创建 attention mask (labels != -100 的位置)
+            attention_mask = (labels != -100).long()
+            
+            # 计算 VC-BDR 损失
+            aux_loss = self.vcbdr_loss_fn(
+                vision_features=last_hidden_state,
+                text_hidden_states=decoder_hidden_states,
+                attention_mask=attention_mask
+            )
+            
+            # 总损失 = 主损失 + lambda * 辅助损失
+            total_loss = main_loss + VCBDR_WEIGHT * aux_loss
+            
+            result['aux_loss'] = aux_loss
+            result['loss'] = total_loss
+        else:
+            result['aux_loss'] = torch.tensor(0.0, device=main_loss.device)
+            result['loss'] = main_loss
+        
+        return result
     
     @torch.no_grad()
     def generate(

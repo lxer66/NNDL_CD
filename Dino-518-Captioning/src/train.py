@@ -1,7 +1,7 @@
 """
-Training Script for DINOv2-Base + T5-Small Image Captioning
-基于 PyTorch Native Loop + Accelerate
-实现改进的两阶段训练策略
+Training Script for DINOv2-Base + Flan-T5-Base Image Captioning
+实现 Adaptive 3-Stage Training Strategy + VC-BDR Loss
+Hardware: RTX 5090 (32GB VRAM) + BF16 + Gradient Accumulation
 """
 
 import os
@@ -18,17 +18,18 @@ from tqdm import tqdm
 import numpy as np
 from PIL import Image
 import math
-import matplotlib.pyplot as plt # 新增：导入绘图库
+import matplotlib.pyplot as plt
+import random
 
 # 设置 matplotlib 后端为 Agg，适用于无显示器的服务器环境
 plt.switch_backend('agg')
 
 from config import (
     BATCH_SIZE,
+    GRAD_ACCUM_STEPS,
     NUM_WORKERS,
+    LR_MLP,
     LR_LORA,
-    LR_MLP_PRETRAIN, # 新增
-    LR_MLP_FINETUNE, # 新增
     EPOCHS,
     BF16,
     CHECKPOINTS_DIR,
@@ -37,7 +38,9 @@ from config import (
     SEED,
     IMAGE_SIZE,
     TEXT_MODEL_PATH,
-    DATA_DIR
+    DATA_DIR,
+    VCBDR_START_EPOCH,
+    VCBDR_WEIGHT
 )
 from modeling import DinoT5LoRAModel
 from dataset import create_dataloaders
@@ -87,7 +90,7 @@ def plot_training_curves(train_history, val_history, lr_history, save_dir):
     ax2.set_ylabel('Learning Rate')
     ax2.set_xlabel('Global Steps')
     ax2.set_yscale('log') # LR 通常跨度较大，使用对数坐标更清晰
-    ax2.set_title('Learning Rate Schedule')
+    ax2.set_title('Differential Multi-Stage LR Schedule')
     ax2.grid(True, which='both', linestyle='--', alpha=0.5)
     ax2.legend()
 
@@ -186,32 +189,36 @@ def perform_blind_test(model, tokenizer, accelerator):
 
 
 def train():
-    """主训练函数"""
+    """主训练函数 - 实现 Adaptive 3-Stage Training Strategy"""
     
     # ============================================================
-    # 1. 初始化 Accelerator
+    # 1. 初始化 Accelerator (with Gradient Accumulation)
     # ============================================================
     accelerator = Accelerator(
         mixed_precision="bf16" if BF16 else "no",
-        gradient_accumulation_steps=1,
+        gradient_accumulation_steps=GRAD_ACCUM_STEPS,  # 关键: 梯度累积
         log_with="tensorboard",
         project_dir=TENSORBOARD_DIR
     )
     
     if accelerator.is_main_process:
         print("=" * 80)
-        print("🚀 DINOv2-Base (518px) + T5-Small Image Captioning Training")
+        print("🚀 DINOv2-Base + Flan-T5-Base Image Captioning Training")
+        print("   Adaptive 3-Stage Strategy + VC-BDR Loss")
         print("=" * 80)
         print(f"  Device: {accelerator.device}")
         print(f"  Mixed Precision: {accelerator.mixed_precision}")
-        print(f"  Batch Size: {BATCH_SIZE}")
+        print(f"  Physical Batch Size: {BATCH_SIZE}")
+        print(f"  Gradient Accumulation Steps: {GRAD_ACCUM_STEPS}")
+        print(f"  Effective Batch Size: {BATCH_SIZE * GRAD_ACCUM_STEPS}")
         print(f"  Epochs: {EPOCHS}")
+        print(f"  VC-BDR Start Epoch: {VCBDR_START_EPOCH + 1} (Index {VCBDR_START_EPOCH})")
         print("=" * 80 + "\n")
     
     set_seed(SEED)
     
     # ============================================================
-    # 2. 加载模型
+    # 2. 加载模型 (启用梯度检查点)
     # ============================================================
     if accelerator.is_main_process:
         print("Loading model...")
@@ -234,23 +241,23 @@ def train():
     val_loader = dataloaders['val']
     
     # ============================================================
-    # 4. 配置优化器
+    # 4. 配置优化器 (差异化学习率)
     # ============================================================
     if accelerator.is_main_process:
-        print("\nConfiguring optimizer...")
+        print("\nConfiguring optimizer with differential learning rates...")
 
     param_groups_dict = model.get_trainable_params()
 
     optimizer_param_groups = [
         {
             'params': param_groups_dict['mlp_params'],
-            'lr': LR_MLP_PRETRAIN,  # 初始使用高学习率 (3e-3)
+            'lr': LR_MLP,  # 1e-3 (High initial LR)
             'weight_decay': 0.01,
             'name': 'mlp_group'
         },
         {
             'params': param_groups_dict['lora_params'],
-            'lr': LR_LORA,          # LoRA 学习率 (3e-4)
+            'lr': LR_LORA,  # 2e-4 (Conservative LR)
             'weight_decay': 0.05,
             'name': 'lora_group'
         }
@@ -259,271 +266,337 @@ def train():
     optimizer = torch.optim.AdamW(optimizer_param_groups)
 
     if accelerator.is_main_process:
-        print(f"  ✓ MLP Group: LR={LR_MLP_PRETRAIN}, WD=0.01")
-        print(f"  ✓ LoRA Group: LR={LR_LORA}, WD=0.05")
+        print(f"  ✓ MLP LR: {LR_MLP}")
+        print(f"  ✓ LoRA LR: {LR_LORA}")
     
     # ============================================================
-    # 5. 学习率调度器 - 阶梯式策略
+    # 5. 学习率调度器 - 差异化多阶段策略 (CRITICAL)
     # ============================================================
     num_training_steps = len(train_loader) * EPOCHS
     steps_per_epoch = len(train_loader)
     
+    # Epoch 0 Warmup steps (10% of Epoch 0)
+    epoch0_warmup_steps = int(0.1 * steps_per_epoch)
+    
+    # Epoch 1+ Warmup steps (前几步, 约5% of remaining steps)
+    stage2_warmup_steps = int(0.05 * steps_per_epoch)
+    
     def get_mlp_lr_lambda(current_step):
         """
-        MLP 调度策略:
-        - Epoch 0 (Stage 1): Warmup -> 保持 LR_MLP_PRETRAIN (1.0倍)
-        - Epoch 1+ (Stage 2): 瞬间降至 LR_MLP_FINETUNE (0.1倍) -> Cosine Decay
+        MLP Learning Rate Schedule (差异化策略)
+        
+        Stage 1 (Epoch 0, steps 0 - steps_per_epoch):
+          - Warmup (前10%步): Linear 0.0 -> 1.0
+          - Then Constant: 1.0x (实际 1e-3)
+        
+        Stage 2 (Epoch 1-14, steps >= steps_per_epoch):
+          - HARD DROP: 立即降至 0.1x (实际 1e-4)
+          - Cosine Decay: 0.1x -> 0.0
+        
+        目的: 防止 MLP 在 T5 解冻后破坏特征
         """
-        # 计算当前在第几个 epoch
         current_epoch = current_step // steps_per_epoch
         
+        # Stage 1: Epoch 0
         if current_epoch == 0:
-            # === Stage 1: Pre-training ===
-            # 简单的 Warmup，然后保持高位
-            warmup_steps = int(steps_per_epoch * 0.1)
-            if current_step < warmup_steps:
-                return float(current_step) / float(max(1, warmup_steps))
-            return 1.0  # 保持 3e-3
-            
+            # Warmup (前10%步)
+            if current_step < epoch0_warmup_steps:
+                return current_step / epoch0_warmup_steps
+            # Constant at 1.0x
+            else:
+                return 1.0
+        
+        # Stage 2: Epoch 1-14
         else:
-            # === Stage 2: Fine-tuning ===
-            # 计算衰减因子: 目标是让基础 LR (3e-3) 变成 (3e-4)
-            # 所以 factor = 3e-4 / 3e-3 = 0.1
-            target_factor = LR_MLP_FINETUNE / LR_MLP_PRETRAIN
+            # 计算从 Epoch 1 开始的步数
+            adjusted_step = current_step - steps_per_epoch
+            adjusted_total_steps = num_training_steps - steps_per_epoch
             
-            # 计算 Stage 2 的进度
-            stage2_total_steps = num_training_steps - steps_per_epoch
-            stage2_current_step = current_step - steps_per_epoch
+            # Cosine Decay from 0.1x to 0.0
+            progress = adjusted_step / adjusted_total_steps
+            cosine_scale = 0.5 * (1 + math.cos(math.pi * progress))
             
-            # Cosine Decay 从 target_factor 降到 0
-            progress = float(stage2_current_step) / float(max(1, stage2_total_steps))
-            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-            
-            return target_factor * cosine_decay
-
+            # HARD DROP: 从 1.0x 降至 0.1x, 然后余弦衰减
+            return 0.1 * cosine_scale
+    
     def get_lora_lr_lambda(current_step):
         """
-        LoRA 调度策略:
-        - Epoch 0: 冻结 (0.0)
-        - Epoch 1+: Warmup -> Cosine Decay
+        LoRA Learning Rate Schedule (差异化策略)
+        
+        Stage 1 (Epoch 0):
+          - Frozen: 0.0x (实际 0.0)
+        
+        Stage 2 (Epoch 1-14):
+          - Linear Warmup (前5%步): 0.0 -> 1.0x (实际 2e-4)
+          - Cosine Decay: 1.0x -> 0.0
         """
         current_epoch = current_step // steps_per_epoch
         
+        # Stage 1: Epoch 0 - Frozen
         if current_epoch == 0:
-            # Stage 1: 完全冻结
             return 0.0
         
-        # Stage 2: 正常训练
-        stage2_total_steps = num_training_steps - steps_per_epoch
-        stage2_current_step = current_step - steps_per_epoch
-        
-        warmup_steps = int(stage2_total_steps * 0.05) # 5% warmup
-        
-        if stage2_current_step < warmup_steps:
-             return float(stage2_current_step) / float(max(1, warmup_steps))
+        # Stage 2: Epoch 1-14
         else:
-            progress = float(stage2_current_step - warmup_steps) / float(max(1, stage2_total_steps - warmup_steps))
-            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
-
+            # 计算从 Epoch 1 开始的步数
+            adjusted_step = current_step - steps_per_epoch
+            adjusted_total_steps = num_training_steps - steps_per_epoch
+            
+            # Warmup (前5%步)
+            if adjusted_step < stage2_warmup_steps:
+                return adjusted_step / stage2_warmup_steps
+            
+            # Cosine Decay from 1.0x to 0.0
+            else:
+                progress = (adjusted_step - stage2_warmup_steps) / (adjusted_total_steps - stage2_warmup_steps)
+                return 0.5 * (1 + math.cos(math.pi * progress))
+    
     from torch.optim.lr_scheduler import LambdaLR
-    scheduler = LambdaLR(optimizer, [get_mlp_lr_lambda, get_lora_lr_lambda])
+    
+    # 为每个参数组创建独立的调度器
+    schedulers = [
+        LambdaLR(optimizer, lr_lambda=get_mlp_lr_lambda),   # 索引 0: MLP
+        LambdaLR(optimizer, lr_lambda=get_lora_lr_lambda)   # 索引 1: LoRA
+    ]
+    
+    # 合并为单个调度器 (Accelerate 兼容)
+    class CombinedScheduler:
+        def __init__(self, schedulers):
+            self.schedulers = schedulers
+        
+        def step(self):
+            for scheduler in self.schedulers:
+                scheduler.step()
+        
+        def get_last_lr(self):
+            return [scheduler.get_last_lr()[0] for scheduler in self.schedulers]
+    
+    scheduler = CombinedScheduler(schedulers)
     
     if accelerator.is_main_process:
-        print(f"\n✓ Advanced Scheduler Configured:")
-        print(f"  - MLP Stage 1 (Epoch 1): LR = {LR_MLP_PRETRAIN:.1e} (High)")
-        print(f"  - MLP Stage 2 (Epoch 2+): LR drops to {LR_MLP_FINETUNE:.1e} -> 0 (Cosine)")
-        print(f"  - LoRA Stage 1: Frozen")
-        print(f"  - LoRA Stage 2: LR = {LR_LORA:.1e} (Cosine)")
-
+        print("\n✓ Differential Multi-Stage LR Scheduler configured:")
+        print("  MLP Strategy:")
+        print(f"    - Epoch 0: Warmup (10% steps) -> Constant 1.0x (1e-3)")
+        print(f"    - Epoch 1+: HARD DROP to 0.1x (1e-4) -> Cosine Decay to 0.0")
+        print("  LoRA Strategy:")
+        print(f"    - Epoch 0: Frozen (0.0x)")
+        print(f"    - Epoch 1+: Warmup (5% steps) -> Cosine Decay from 1.0x (2e-4) to 0.0")
+        print(f"  Warmup steps: Epoch0={epoch0_warmup_steps}, Stage2={stage2_warmup_steps}")
+    
     # ============================================================
-    # 6. Accelerate 包装
+    # 6. Accelerate Preparation
     # ============================================================
-    model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
-        model, optimizer, train_loader, val_loader, scheduler
+    model, optimizer, train_loader, val_loader = accelerator.prepare(
+        model, optimizer, train_loader, val_loader
     )
     
     # ============================================================
-    # 7. TensorBoard
+    # 7. 初始化 TensorBoard
     # ============================================================
     if accelerator.is_main_process:
         writer = SummaryWriter(log_dir=TENSORBOARD_DIR)
     
     # ============================================================
-    # 8. 盲人测试 (训练前)
+    # 8. 加载 Tokenizer (用于 Blind Test)
     # ============================================================
-    if accelerator.is_main_process:
-        tokenizer = AutoTokenizer.from_pretrained(TEXT_MODEL_PATH)
-        perform_blind_test(
-            accelerator.unwrap_model(model),
-            tokenizer,
-            accelerator
-        )
+    tokenizer = AutoTokenizer.from_pretrained(TEXT_MODEL_PATH)
     
     # ============================================================
     # 9. 训练循环
     # ============================================================
+    if accelerator.is_main_process:
+        print("\n" + "=" * 80)
+        print("Starting Training")
+        print("=" * 80 + "\n")
+    
     global_step = 0
     best_val_loss = float('inf')
     
-    # 新增：用于记录绘图数据的列表
-    train_loss_history = []
-    val_loss_history = []
+    # 历史记录
+    train_history = []
+    val_history = []
     lr_history = []
     
     for epoch in range(EPOCHS):
-        # 确定当前阶段
-        if epoch == 0:
-            stage_name = "Stage 1: MLP Pre-training (LoRA Frozen)"
-        else:
-            stage_name = "Stage 2: Joint Fine-tuning"
-        
-        if accelerator.is_main_process:
-            print("\n" + "=" * 80)
-            print(f"Epoch {epoch + 1}/{EPOCHS} - {stage_name}")
-            print("=" * 80)
-        
-        # ============================================================
-        # 训练阶段
-        # ============================================================
         model.train()
-        epoch_loss = 0
+        epoch_train_loss = 0.0
+        epoch_main_loss = 0.0
+        epoch_aux_loss = 0.0
         
-        progress_bar = tqdm(
-            train_loader,
-            desc=f"Epoch {epoch + 1}/{EPOCHS}",
-            disable=not accelerator.is_main_process
-        )
-        
-        for step, batch in enumerate(progress_bar):
-            # Forward
-            outputs = model(
-                pixel_values=batch['pixel_values'],
-                labels=batch['labels']
-            )
-            loss = outputs['loss']
-            
-            # Backward
-            accelerator.backward(loss)
-            
-            # 梯度裁剪
-            accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            # Optimizer step
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
-            
-            # 统计
-            epoch_loss += loss.item()
-            global_step += 1
-            
-            # 日志记录
-            if global_step % LOG_INTERVAL == 0:
-                avg_loss = epoch_loss / (step + 1)
-                
-                # 获取当前实际学习率
-                current_lr_mlp = scheduler.get_last_lr()[0]
-                current_lr_lora = scheduler.get_last_lr()[1]
-                
-                # 新增：记录数据
-                train_loss_history.append((global_step, loss.item())) # 记录当前step的loss，或者用avg_loss
-                lr_history.append((global_step, current_lr_mlp, current_lr_lora))
-
-                progress_bar.set_postfix({
-                    'loss': f'{avg_loss:.4f}',
-                    'lr_mlp': f'{current_lr_mlp:.2e}',
-                    'lr_lora': f'{current_lr_lora:.2e}'
-                })
-                
-                if accelerator.is_main_process:
-                    writer.add_scalar('Train/Loss', avg_loss, global_step)
-                    writer.add_scalar('Train/LR_MLP', current_lr_mlp, global_step)
-                    writer.add_scalar('Train/LR_LoRA', current_lr_lora, global_step)
-        
-        # ============================================================
-        # 验证阶段
-        # ============================================================
-        model.eval()
-        val_loss = 0
+        # 判断是否启用 VC-BDR
+        use_vcbdr = (epoch >= VCBDR_START_EPOCH)
         
         if accelerator.is_main_process:
-            print("\n  Validating...")
+            print(f"\n{'='*80}")
+            print(f"Epoch {epoch + 1}/{EPOCHS}")
+            
+            # 打印当前阶段信息
+            if epoch == 0:
+                print("  Stage 1: MLP Warm-up (LoRA Frozen, No VC-BDR)")
+            elif epoch < VCBDR_START_EPOCH:
+                print(f"  Stage 2: Joint Training (No VC-BDR)")
+            else:
+                print(f"  Stage 3: VC-BDR Enabled (λ={VCBDR_WEIGHT})")
+            
+            print(f"{'='*80}\n")
+            
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}")
+        else:
+            pbar = train_loader
+        
+        for batch_idx, batch in enumerate(pbar):
+            with accelerator.accumulate(model):
+                pixel_values = batch['pixel_values']
+                labels = batch['labels']
+                
+                # 前向传播 (传递 use_vcbdr 标志)
+                outputs = model(
+                    pixel_values=pixel_values,
+                    labels=labels,
+                    use_vcbdr=use_vcbdr
+                )
+                
+                loss = outputs['loss']
+                main_loss = outputs['main_loss']
+                aux_loss = outputs['aux_loss']
+                
+                # 反向传播
+                accelerator.backward(loss)
+                
+                # 梯度裁剪
+                accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                # 优化器步骤
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+            
+            # 累积损失
+            epoch_train_loss += loss.item()
+            epoch_main_loss += main_loss.item()
+            epoch_aux_loss += aux_loss.item() if use_vcbdr else 0.0
+            
+            # 记录到 TensorBoard
+            if accelerator.is_main_process and global_step % LOG_INTERVAL == 0:
+                writer.add_scalar('Train/Total_Loss', loss.item(), global_step)
+                writer.add_scalar('Train/Main_Loss', main_loss.item(), global_step)
+                if use_vcbdr:
+                    writer.add_scalar('Train/Aux_Loss', aux_loss.item(), global_step)
+                
+                # 记录学习率 (分别记录 MLP 和 LoRA)
+                current_lrs = scheduler.get_last_lr()
+                mlp_lr = current_lrs[0]  # MLP group
+                lora_lr = current_lrs[1]  # LoRA group
+                
+                writer.add_scalar('LR/MLP', mlp_lr, global_step)
+                writer.add_scalar('LR/LoRA', lora_lr, global_step)
+                
+                # 保存历史
+                train_history.append((global_step, loss.item()))
+                lr_history.append((global_step, mlp_lr, lora_lr))
+            
+            # 更新进度条 (显示当前学习率)
+            if accelerator.is_main_process:
+                current_lrs = scheduler.get_last_lr()
+                pbar.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'main': f'{main_loss.item():.4f}',
+                    'aux': f'{aux_loss.item():.4f}' if use_vcbdr else 'N/A',
+                    'mlp_lr': f'{current_lrs[0]:.2e}',
+                    'lora_lr': f'{current_lrs[1]:.2e}'
+                })
+            
+            global_step += 1
+        
+        # 计算平均损失
+        avg_train_loss = epoch_train_loss / len(train_loader)
+        avg_main_loss = epoch_main_loss / len(train_loader)
+        avg_aux_loss = epoch_aux_loss / len(train_loader) if use_vcbdr else 0.0
+        
+        # ============================================================
+        # 验证
+        # ============================================================
+        if accelerator.is_main_process:
+            print(f"\n{'='*60}")
+            print("Running Validation...")
+            print(f"{'='*60}")
+        
+        model.eval()
+        val_loss = 0.0
         
         with torch.no_grad():
-            for batch in val_loader:
+            for batch in tqdm(val_loader, desc="Validation", disable=not accelerator.is_main_process):
+                pixel_values = batch['pixel_values']
+                labels = batch['labels']
+                
                 outputs = model(
-                    pixel_values=batch['pixel_values'],
-                    labels=batch['labels']
+                    pixel_values=pixel_values,
+                    labels=labels,
+                    use_vcbdr=False  # 验证时不使用 VC-BDR
                 )
+                
                 val_loss += outputs['loss'].item()
         
-        val_loss /= len(val_loader)
-        
-        # 新增：记录验证损失
-        val_loss_history.append((global_step, val_loss))
+        avg_val_loss = val_loss / len(val_loader)
         
         if accelerator.is_main_process:
-            print(f"  ✓ Validation Loss: {val_loss:.4f}")
-            writer.add_scalar('Val/Loss', val_loss, epoch)
+            writer.add_scalar('Val/Loss', avg_val_loss, epoch)
+            val_history.append((global_step, avg_val_loss))
             
-            # 新增：绘制并保存曲线图
-            print("  📈 Plotting training curves...")
+            print(f"\n{'='*60}")
+            print(f"Epoch {epoch + 1} Summary:")
+            print(f"{'='*60}")
+            print(f"  Train Loss: {avg_train_loss:.4f}")
+            print(f"  Main Loss:  {avg_main_loss:.4f}")
+            if use_vcbdr:
+                print(f"  Aux Loss:   {avg_aux_loss:.4f}")
+            print(f"  Val Loss:   {avg_val_loss:.4f}")
+            print(f"{'='*60}\n")
+        
+        # ============================================================
+        # 保存检查点
+        # ============================================================
+        if accelerator.is_main_process:
+            # 保存当前 epoch
+            save_dir = CHECKPOINTS_DIR / f"epoch_{epoch + 1}"
+            save_dir.mkdir(parents=True, exist_ok=True)
             
-            # === 补全缺失的调用代码 ===
-            plot_training_curves(
-                train_loss_history, 
-                val_loss_history, 
-                lr_history, 
-                CHECKPOINTS_DIR
-            )
-
-            # 获取解包后的模型（去除 DDP/Accelerate 包装）
             unwrapped_model = accelerator.unwrap_model(model)
-
-            # 保存最佳模型逻辑
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                print(f"  ★ New Best Model! Saving to {CHECKPOINTS_DIR}/best_model")
-                # 1. 保存 Accelerator 完整状态 (用于恢复训练)
-                accelerator.save_state(output_dir=str(CHECKPOINTS_DIR / "best_model_state"))
-                # 2. 保存推理所需的组件 (用于 inference.py)
-                unwrapped_model.save_trainable(str(CHECKPOINTS_DIR / "best_model"))
+            unwrapped_model.save_trainable(str(save_dir))
             
-            # 保存最新模型
-            current_ckpt_dir = CHECKPOINTS_DIR / f"checkpoint-{epoch+1}-val_loss_{val_loss:.4f}"
-            # 1. 保存 Accelerator 完整状态
-            accelerator.save_state(output_dir=str(current_ckpt_dir / "state"))
-            # 2. 保存推理所需的组件 (关键修复!!!)
-            unwrapped_model.save_trainable(str(current_ckpt_dir))
-    
-            # 新增：每轮结束后运行盲人测试，实时监控模型状态
-            print(f"\n  🔍 Running Blind Test for Epoch {epoch + 1}...")
-            perform_blind_test(
-                unwrapped_model,
-                tokenizer,
-                accelerator
-            )
+            print(f"✓ Checkpoint saved to {save_dir}")
+            
+            # 保存最佳模型
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                best_save_dir = CHECKPOINTS_DIR / "best_model"
+                best_save_dir.mkdir(parents=True, exist_ok=True)
+                unwrapped_model.save_trainable(str(best_save_dir))
+                print(f"✓ Best model updated (Val Loss: {best_val_loss:.4f})")
+        
+        # ============================================================
+        # Blind Test (每个 epoch 后)
+        # ============================================================
+        if accelerator.is_main_process:
+            perform_blind_test(accelerator.unwrap_model(model), tokenizer, accelerator)
     
     # ============================================================
-    # 10. 盲人测试 (训练后)
+    # 训练完成
     # ============================================================
     if accelerator.is_main_process:
-        print("\n🔍 Performing Blind Test (Posterior Collapse Detection) - After Training")
-        perform_blind_test(
-            accelerator.unwrap_model(model),
-            tokenizer,
-            accelerator
-        )
-    
-    # ============================================================
-    # 11. 结束
-    # ============================================================
-    if accelerator.is_main_process:
+        print("\n" + "=" * 80)
+        print("🎉 Training Complete!")
         print("=" * 80)
-        print("✅ Training Complete!")
-        print(f"  - Best Validation Loss: {best_val_loss:.4f}")
-        print(f"  - Checkpoints saved in: {CHECKPOINTS_DIR}")
-        print("=" * 80)
+        print(f"  Best Val Loss: {best_val_loss:.4f}")
+        print(f"  Total Steps: {global_step}")
+        print("=" * 80 + "\n")
+        
+        # 绘制训练曲线
+        print("Generating training curves...")
+        plot_training_curves(train_history, val_history, lr_history, CHECKPOINTS_DIR)
+        print(f"✓ Training curves saved to {CHECKPOINTS_DIR / 'training_curves.png'}")
+        
+        writer.close()
 
 
 if __name__ == "__main__":

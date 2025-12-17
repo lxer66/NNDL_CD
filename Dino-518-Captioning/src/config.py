@@ -16,7 +16,7 @@ OUTPUT_DIR = PROJECT_ROOT / "output"
 
 # 预训练模型路径
 VISION_MODEL_PATH = str(MODELS_DIR / "dinov2-base")
-TEXT_MODEL_PATH = str(MODELS_DIR / "t5-small")
+TEXT_MODEL_PATH = str(MODELS_DIR / "flan-t5-base")
 
 # 输出路径
 CHECKPOINTS_DIR = OUTPUT_DIR / "checkpoints"
@@ -35,18 +35,16 @@ IMAGE_SIZE = 518
 # ============================================================
 # 3. 训练超参数 (Training Hyperparameters)
 # ============================================================
-# 批次大小 - RTX 5090 32GB 显存优化,使用大批次加速训练
-BATCH_SIZE = 20
+# 批次大小 - RTX 5090 32GB 显存优化
+BATCH_SIZE = 16              # Physical batch size (fits in VRAM)
+GRAD_ACCUM_STEPS = 2         # Gradient accumulation (effective batch = 32)
 
 # 数据加载
 NUM_WORKERS = 16
 
-# 学习率配置
-LR_LORA = 3e-4          # LoRA 学习率 (Stage 2)
-
-# MLP 学习率策略
-LR_MLP_PRETRAIN = 3e-3  # Stage 1 (Epoch 0): 高学习率，快速对齐
-LR_MLP_FINETUNE = 3e-4  # Stage 2 (Epoch 1+): 低学习率 (1/10)，防止破坏 LoRA
+# 学习率配置 (Differential Learning Rates)
+LR_MLP = 1e-3           # MLP Connector 学习率 (高, 随机初始化)
+LR_LORA = 2e-4          # LoRA 学习率 (低, 预训练权重)
 
 # 训练轮数
 EPOCHS = 15
@@ -73,8 +71,12 @@ TEXT_LORA_TARGETS = ["q", "v"]
 
 # MLP Connector 配置
 DINO_HIDDEN_SIZE = 768    # DINOv2-Base 输出维度
-T5_HIDDEN_SIZE = 512      # T5-Small 输入维度
-MLP_HIDDEN_SIZE = 2048    # MLP 中间层维度
+T5_HIDDEN_SIZE = 768      # Flan-T5-Base 输入维度
+MLP_HIDDEN_SIZE = 2048    # SwiGLU MLP 中间层维度 (2.67x embedding dim)
+
+# VC-BDR Loss 配置 (Visually-Constrained Batch Diversity Regularization)
+VCBDR_START_EPOCH = 2     # 从 Epoch 3 (index=2) 开始启用辅助损失
+VCBDR_WEIGHT = 0.1        # VC-BDR 损失权重 (lambda)
 
 # ============================================================
 # 5. 生成配置 (Generation Config)
