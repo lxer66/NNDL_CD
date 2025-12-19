@@ -160,7 +160,7 @@ class DinoT5LoRAModel(nn.Module):
         self.t5_model.print_trainable_parameters()
         
         # 4. 初始化 VC-BDR Loss
-        self.vcbdr_loss_fn = VC_BDR_Loss(temperature=0.07)
+        self.vcbdr_loss_fn = VC_BDR_Loss()
         
         print("\n" + "=" * 60)
         print("✓ Model initialization complete")

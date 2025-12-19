@@ -1,5 +1,5 @@
 """
-Inference Script for DINOv2-Base + T5-Small Image Captioning
+Inference Script for DINOv2-Base + Flan-T5-Base Image Captioning
 支持单张图片推理和批量推理
 """
 
@@ -143,6 +143,7 @@ class ImageCaptioner:
         self,
         image_paths: List[Union[str, Path]],
         batch_size: int = 8,
+        num_workers: int = 0,
         **kwargs
     ) -> List[str]:
         """
@@ -160,10 +161,13 @@ class ImageCaptioner:
         for i in range(0, len(image_paths), batch_size):
             batch_paths = image_paths[i:i + batch_size]
             
-            # 批量预处理
-            pixel_values_list = [
-                self.preprocess_image(path) for path in batch_paths
-            ]
+            # 批量预处理（可选多线程加速 I/O 和 CPU 解码）
+            if num_workers and num_workers > 0:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=num_workers) as ex:
+                    pixel_values_list = list(ex.map(self.preprocess_image, batch_paths))
+            else:
+                pixel_values_list = [self.preprocess_image(path) for path in batch_paths]
             pixel_values = torch.cat(pixel_values_list, dim=0)
             
             # 批量生成

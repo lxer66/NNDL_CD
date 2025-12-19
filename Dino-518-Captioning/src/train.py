@@ -21,6 +21,11 @@ import math
 import matplotlib.pyplot as plt
 import random
 
+# CUDA 加速：TF32 + cuDNN benchmark（安全不改精度）
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+
 # 设置 matplotlib 后端为 Agg，适用于无显示器的服务器环境
 plt.switch_backend('agg')
 
@@ -39,6 +44,7 @@ from config import (
     IMAGE_SIZE,
     TEXT_MODEL_PATH,
     DATA_DIR,
+    IMAGES_DIR,
     VCBDR_START_EPOCH,
     VCBDR_WEIGHT
 )
@@ -46,23 +52,36 @@ from modeling import DinoT5LoRAModel
 from dataset import create_dataloaders
 
 
-def plot_training_curves(train_history, val_history, lr_history, save_dir):
+def plot_training_curves(train_history, val_history, lr_history, save_path):
     """
-    绘制并保存训练曲线
+    绘制并保存训练/验证损失与学习率曲线
     Args:
         train_history: List[(step, loss)]
         val_history: List[(step, loss)]
         lr_history: List[(step, mlp_lr, lora_lr)]
-        save_dir: 保存目录
+        save_path: 具体保存文件路径
     """
     if not train_history:
         return
 
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
     
-    # 1. 绘制 Loss 曲线
+    # 1) 损失曲线
     train_steps, train_losses = zip(*train_history)
     ax1.plot(train_steps, train_losses, label='Train Loss', alpha=0.6, color='blue', linewidth=1)
+
+    # 标注最低训练损失
+    min_train_loss = min(train_losses)
+    min_train_idx = train_losses.index(min_train_loss)
+    min_train_step = train_steps[min_train_idx]
+    ax1.annotate(f'Min Train: {min_train_loss:.4f}',
+                 xy=(min_train_step, min_train_loss),
+                 xytext=(min_train_step, min_train_loss + 0.4),
+                 arrowprops=dict(facecolor='blue', shrink=0.05),
+                 fontsize=9, color='blue')
     
     if val_history:
         val_steps, val_losses = zip(*val_history)
@@ -72,31 +91,31 @@ def plot_training_curves(train_history, val_history, lr_history, save_dir):
         min_val_loss = min(val_losses)
         min_val_idx = val_losses.index(min_val_loss)
         min_val_step = val_steps[min_val_idx]
-        ax1.annotate(f'Min Val: {min_val_loss:.4f}', 
-                     xy=(min_val_step, min_val_loss), 
-                     xytext=(min_val_step, min_val_loss + 0.5),
-                     arrowprops=dict(facecolor='black', shrink=0.05))
+        ax1.annotate(f'Min Val: {min_val_loss:.4f}',
+                     xy=(min_val_step, min_val_loss),
+                     xytext=(min_val_step, min_val_loss + 0.4),
+                     arrowprops=dict(facecolor='red', shrink=0.05),
+                     fontsize=9, color='red')
 
     ax1.set_ylabel('Loss')
     ax1.set_title('Training & Validation Loss')
     ax1.grid(True, which='both', linestyle='--', alpha=0.5)
     ax1.legend()
 
-    # 2. 绘制 Learning Rate 曲线
+    # 2) 学习率曲线
     lr_steps, mlp_lrs, lora_lrs = zip(*lr_history)
     ax2.plot(lr_steps, mlp_lrs, label='MLP LR', color='purple', linestyle='-')
     ax2.plot(lr_steps, lora_lrs, label='LoRA LR', color='green', linestyle='--')
     
     ax2.set_ylabel('Learning Rate')
     ax2.set_xlabel('Global Steps')
-    ax2.set_yscale('log') # LR 通常跨度较大，使用对数坐标更清晰
+    ax2.set_yscale('log')
     ax2.set_title('Differential Multi-Stage LR Schedule')
     ax2.grid(True, which='both', linestyle='--', alpha=0.5)
     ax2.legend()
 
-    # 保存图片
     plt.tight_layout()
-    plt.savefig(save_dir / 'training_curves.png', dpi=150)
+    plt.savefig(save_path, dpi=150)
     plt.close()
 
 
@@ -118,7 +137,7 @@ def perform_blind_test(model, tokenizer, accelerator):
     model.eval()
     
     # 1. 加载一张真实图片
-    data_images_dir = DATA_DIR / "images"
+    data_images_dir = Path(IMAGES_DIR)
     real_image_files = list(data_images_dir.glob("*.jpg"))[:1]
     
     if not real_image_files:
@@ -223,6 +242,7 @@ def train():
     if accelerator.is_main_process:
         print("Loading model...")
     
+    # 开启梯度检查点以控制显存占用
     model = DinoT5LoRAModel(use_gradient_checkpointing=True)
     
     # ============================================================
@@ -263,7 +283,11 @@ def train():
         }
     ]
     
-    optimizer = torch.optim.AdamW(optimizer_param_groups)
+    # fused AdamW 可在 CUDA 上进一步提速；若不支持则回退
+    try:
+        optimizer = torch.optim.AdamW(optimizer_param_groups, fused=True)
+    except TypeError:
+        optimizer = torch.optim.AdamW(optimizer_param_groups)
 
     if accelerator.is_main_process:
         print(f"  ✓ MLP LR: {LR_MLP}")
@@ -353,26 +377,12 @@ def train():
     
     from torch.optim.lr_scheduler import LambdaLR
     
-    # 为每个参数组创建独立的调度器
-    schedulers = [
-        LambdaLR(optimizer, lr_lambda=get_mlp_lr_lambda),   # 索引 0: MLP
-        LambdaLR(optimizer, lr_lambda=get_lora_lr_lambda)   # 索引 1: LoRA
-    ]
-    
-    # 合并为单个调度器 (Accelerate 兼容)
-    class CombinedScheduler:
-        def __init__(self, schedulers):
-            self.schedulers = schedulers
-        
-        def step(self):
-            for scheduler in self.schedulers:
-                scheduler.step()
-        
-        def get_last_lr(self):
-            return [scheduler.get_last_lr()[0] for scheduler in self.schedulers]
-    
-    scheduler = CombinedScheduler(schedulers)
-    
+    # 为两个 param group 分别指定 lambda
+    scheduler = LambdaLR(
+        optimizer,
+        lr_lambda=[get_mlp_lr_lambda, get_lora_lr_lambda]
+    )
+
     if accelerator.is_main_process:
         print("\n✓ Differential Multi-Stage LR Scheduler configured:")
         print("  MLP Strategy:")
@@ -421,7 +431,7 @@ def train():
         model.train()
         epoch_train_loss = 0.0
         epoch_main_loss = 0.0
-        epoch_aux_loss = 0.0
+        epoch_aux_loss = 0.0  # weighted aux
         
         # 判断是否启用 VC-BDR
         use_vcbdr = (epoch >= VCBDR_START_EPOCH)
@@ -459,6 +469,7 @@ def train():
                 loss = outputs['loss']
                 main_loss = outputs['main_loss']
                 aux_loss = outputs['aux_loss']
+                aux_loss_weighted = aux_loss * VCBDR_WEIGHT if use_vcbdr else torch.tensor(0.0, device=loss.device)
                 
                 # 反向传播
                 accelerator.backward(loss)
@@ -474,20 +485,20 @@ def train():
             # 累积损失
             epoch_train_loss += loss.item()
             epoch_main_loss += main_loss.item()
-            epoch_aux_loss += aux_loss.item() if use_vcbdr else 0.0
+            epoch_aux_loss += aux_loss_weighted.item() if use_vcbdr else 0.0
             
             # 记录到 TensorBoard
             if accelerator.is_main_process and global_step % LOG_INTERVAL == 0:
-                writer.add_scalar('Train/Total_Loss', loss.item(), global_step)
-                writer.add_scalar('Train/Main_Loss', main_loss.item(), global_step)
+                writer.add_scalar('train/loss_total', loss.item(), global_step)
+                writer.add_scalar('train/loss_ce', main_loss.item(), global_step)
                 if use_vcbdr:
-                    writer.add_scalar('Train/Aux_Loss', aux_loss.item(), global_step)
+                    writer.add_scalar('train/loss_vcbdr', aux_loss_weighted.item(), global_step)
                 
                 # 记录学习率 (分别记录 MLP 和 LoRA)
                 current_lrs = scheduler.get_last_lr()
-                mlp_lr = current_lrs[0]  # MLP group
-                lora_lr = current_lrs[1]  # LoRA group
-                
+                mlp_lr = current_lrs[0]
+                lora_lr = current_lrs[1]
+
                 writer.add_scalar('LR/MLP', mlp_lr, global_step)
                 writer.add_scalar('LR/LoRA', lora_lr, global_step)
                 
@@ -501,7 +512,7 @@ def train():
                 pbar.set_postfix({
                     'loss': f'{loss.item():.4f}',
                     'main': f'{main_loss.item():.4f}',
-                    'aux': f'{aux_loss.item():.4f}' if use_vcbdr else 'N/A',
+                    'aux_w': f'{aux_loss_weighted.item():.4f}' if use_vcbdr else 'N/A',
                     'mlp_lr': f'{current_lrs[0]:.2e}',
                     'lora_lr': f'{current_lrs[1]:.2e}'
                 })
@@ -579,6 +590,13 @@ def train():
         # ============================================================
         if accelerator.is_main_process:
             perform_blind_test(accelerator.unwrap_model(model), tokenizer, accelerator)
+
+        # ============================================================
+        # 每个 epoch 结束后实时更新训练曲线
+        # ============================================================
+        if accelerator.is_main_process:
+            epoch_curve_path = CHECKPOINTS_DIR / f"training_curves_epoch_{epoch + 1}.png"
+            plot_training_curves(train_history, val_history, lr_history, epoch_curve_path)
     
     # ============================================================
     # 训练完成
@@ -593,8 +611,9 @@ def train():
         
         # 绘制训练曲线
         print("Generating training curves...")
-        plot_training_curves(train_history, val_history, lr_history, CHECKPOINTS_DIR)
-        print(f"✓ Training curves saved to {CHECKPOINTS_DIR / 'training_curves.png'}")
+        final_curve_path = CHECKPOINTS_DIR / 'training_curves.png'
+        plot_training_curves(train_history, val_history, lr_history, final_curve_path)
+        print(f"✓ Training curves saved to {final_curve_path}")
         
         writer.close()
 

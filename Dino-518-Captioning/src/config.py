@@ -1,5 +1,5 @@
 """
-Global Configuration for DINOv2-Base (518px) + T5-Small Captioning
+Global Configuration for DINOv2-Base (518px) + Flan-T5-Base Captioning
 Hardware: RTX 5090 (32GB VRAM)
 """
 
@@ -9,14 +9,18 @@ from pathlib import Path
 # ============================================================
 # 1. 路径配置 (Path Configuration)
 # ============================================================
-PROJECT_ROOT = Path(__file__).parent.parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent  # dinov2_t5/
 MODELS_DIR = PROJECT_ROOT / "models"
 DATA_DIR = PROJECT_ROOT / "data"
 OUTPUT_DIR = PROJECT_ROOT / "output"
 
+# 数据源
+CAPTIONS_PATH = DATA_DIR / "captions_aug.json"
+IMAGES_DIR = DATA_DIR / "aug_images"
+
 # 预训练模型路径
 VISION_MODEL_PATH = str(MODELS_DIR / "dinov2-base")
-TEXT_MODEL_PATH = str(MODELS_DIR / "flan-t5-base")
+TEXT_MODEL_PATH = str(MODELS_DIR / "flan-t5-base")  # 切换到 Flan-T5-Base
 
 # 输出路径
 CHECKPOINTS_DIR = OUTPUT_DIR / "checkpoints"
@@ -35,9 +39,9 @@ IMAGE_SIZE = 518
 # ============================================================
 # 3. 训练超参数 (Training Hyperparameters)
 # ============================================================
-# 批次大小 - RTX 5090 32GB 显存优化
-BATCH_SIZE = 16              # Physical batch size (fits in VRAM)
-GRAD_ACCUM_STEPS = 2         # Gradient accumulation (effective batch = 32)
+# 批次大小 - RTX 5090 32GB 显存优化（关闭梯度累积，直接物理批次=32）
+BATCH_SIZE = 32              # Physical batch size
+GRAD_ACCUM_STEPS = 1         # No gradient accumulation; effective batch = 32
 
 # 数据加载
 NUM_WORKERS = 16
@@ -71,12 +75,12 @@ TEXT_LORA_TARGETS = ["q", "v"]
 
 # MLP Connector 配置
 DINO_HIDDEN_SIZE = 768    # DINOv2-Base 输出维度
-T5_HIDDEN_SIZE = 768      # Flan-T5-Base 输入维度
+T5_HIDDEN_SIZE = 768      # Flan-T5-Base 输入维度 (base 模型为 768)
 MLP_HIDDEN_SIZE = 2048    # SwiGLU MLP 中间层维度 (2.67x embedding dim)
 
 # VC-BDR Loss 配置 (Visually-Constrained Batch Diversity Regularization)
 VCBDR_START_EPOCH = 2     # 从 Epoch 3 (index=2) 开始启用辅助损失
-VCBDR_WEIGHT = 0.1        # VC-BDR 损失权重 (lambda)
+VCBDR_WEIGHT = 5        # VC-BDR 损失权重 (lambda)
 
 # ============================================================
 # 5. 生成配置 (Generation Config)
@@ -122,6 +126,8 @@ def validate_config():
     assert IMAGE_SIZE == 518, f"Expected IMAGE_SIZE=518 for optimal DINOv2 performance, got {IMAGE_SIZE}"
     assert os.path.exists(VISION_MODEL_PATH), f"Vision model not found at {VISION_MODEL_PATH}"
     assert os.path.exists(TEXT_MODEL_PATH), f"Text model not found at {TEXT_MODEL_PATH}"
+    assert CAPTIONS_PATH.exists(), f"Captions file not found at {CAPTIONS_PATH}"
+    assert IMAGES_DIR.exists(), f"Images directory not found at {IMAGES_DIR}"
     print("✓ Configuration validated successfully")
     print(f"  - Image Size: {IMAGE_SIZE}×{IMAGE_SIZE}")
     print(f"  - Batch Size: {BATCH_SIZE}")

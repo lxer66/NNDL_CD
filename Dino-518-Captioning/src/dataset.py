@@ -1,5 +1,5 @@
 """
-Dataset for DINOv2-Base (518px) + T5-Small Image Captioning
+Dataset for DINOv2-Base (518px) + Flan-T5-Base Image Captioning
 处理已经resize到518×518的图像和JSONL格式的标注
 """
 
@@ -19,6 +19,7 @@ from config import (
     IMAGE_SIZE, 
     MAX_LENGTH,
     DATA_DIR,
+    IMAGES_DIR,
     BATCH_SIZE,
     NUM_WORKERS
 )
@@ -43,6 +44,9 @@ class CaptioningDataset(Dataset):
         super().__init__()
         self.split = split
         self.data_root = Path(data_root) if data_root else DATA_DIR
+        # 允许自定义 data_root，但图片目录始终指向新的增广图片子目录
+        images_subdir = Path(IMAGES_DIR).name
+        self.images_dir = (self.data_root / images_subdir)
         
         # 加载标注数据 (JSONL格式)
         annotations_path = self.data_root / f"{split}.jsonl"
@@ -81,7 +85,7 @@ class CaptioningDataset(Dataset):
         sample = self.annotations[idx]
         
         # 1. 加载图像 (已经是518×518)
-        image_path = self.data_root / "images" / sample['image']
+        image_path = self.images_dir / sample['image']
         image = Image.open(image_path).convert('RGB')
         
         # 2. 图像处理 - 关键修正!!!
@@ -122,7 +126,7 @@ class CaptioningDataset(Dataset):
         """获取样本的元信息 (用于调试和可视化)"""
         sample = self.annotations[idx]
         return {
-            'image_path': str(self.data_root / "images" / sample['image']),
+            'image_path': str(self.images_dir / sample['image']),
             'caption': sample['caption'],
             'image_id': sample.get('image_id', sample['image'])
         }

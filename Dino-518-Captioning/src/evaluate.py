@@ -165,7 +165,8 @@ class CaptioningEvaluator:
         self,
         split: str = "test",
         num_samples: int = None,
-        batch_size: int = 8
+        batch_size: int = 32,
+        num_workers: int = 16
     ) -> Dict[str, float]:
         """
         在数据集上评估
@@ -190,26 +191,28 @@ class CaptioningEvaluator:
         
         print(f"Total samples: {len(dataset)}")
         
-        # 收集预测和参考
+        # 收集预测和参考（批量推理）
         predictions = []
         references = []
         
-        print("\nGenerating captions...")
-        for i in tqdm(range(len(dataset))):
-            sample_info = dataset.get_sample_info(i)
-            image_path = sample_info['image_path']
-            reference = sample_info['caption']
-            
-            # 生成预测
-            prediction = self.captioner.generate_caption(
-                image_path=image_path,
+        print("\nGenerating captions in batches...")
+        for start in tqdm(range(0, len(dataset), batch_size)):
+            end = min(start + batch_size, len(dataset))
+            batch_infos = [dataset.get_sample_info(i) for i in range(start, end)]
+            batch_paths = [info['image_path'] for info in batch_infos]
+            batch_refs = [info['caption'] for info in batch_infos]
+
+            batch_preds = self.captioner.batch_generate(
+                image_paths=batch_paths,
+                batch_size=len(batch_paths),
+                num_workers=num_workers,
                 num_beams=NUM_BEAMS,
                 repetition_penalty=REPETITION_PENALTY,
                 max_length=MAX_NEW_TOKENS
             )
-            
-            predictions.append(prediction)
-            references.append(reference)
+
+            predictions.extend(batch_preds)
+            references.extend(batch_refs)
         
         # 计算指标
         print("\nComputing metrics...")
@@ -269,8 +272,14 @@ def main():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=8,
+        default=32,
         help="Batch size for inference"
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=16,
+        help="Number of worker threads for image preprocessing"
     )
     parser.add_argument(
         "--output",
@@ -301,7 +310,8 @@ def main():
     metrics, predictions, references = evaluator.evaluate_dataset(
         split=args.split,
         num_samples=args.num_samples,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        num_workers=args.num_workers
     )
     
     # 保存结果

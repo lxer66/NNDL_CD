@@ -16,6 +16,9 @@ from collections import defaultdict
 from PIL import Image
 from tqdm import tqdm
 
+# 使用全局配置的路径，确保与服务器目录一致
+from config import CAPTIONS_PATH, IMAGES_DIR, DATA_DIR, IMAGE_SIZE
+
 
 class DataPreprocessor:
     """DINOv2-T5 数据预处理器"""
@@ -228,23 +231,24 @@ def main():
     """主函数 - 配置路径并运行预处理"""
     
     # ========== 配置区域 ==========
-    CAPTIONS_PATH = "data/captions.json"       # captions.json 路径
-    IMAGES_DIR = "data/images"                 # 图片文件夹路径
-    OUTPUT_DIR = "data"                        # 输出目录
-    
-    IMAGE_SIZE = 518                              # DINOv2 原生分辨率
-    MIN_WORDS = 5                                 # 最小单词数
-    TRAIN_RATIO = 0.8                             # 80% 训练集
-    VAL_RATIO = 0.1                               # 10% 验证集
-    SEED = 42                                     # 随机种子
+    # 使用配置中的新数据源 (增广后的 captions 和图片)
+    CAPTIONS_FILE = CAPTIONS_PATH
+    IMAGES_FOLDER = IMAGES_DIR
+    OUTPUT_DIR = DATA_DIR  # 产出 train/val/test.jsonl 到 data/
+
+    IMAGE_SIZE_CFG = IMAGE_SIZE                      # DINOv2 原生分辨率
+    MIN_WORDS = 5                                    # 最小单词数
+    TRAIN_RATIO = 0.8                                # 80% 训练集
+    VAL_RATIO = 0.1                                  # 10% 验证集
+    SEED = 42                                        # 随机种子
     # ==============================
     
     # 实例化并运行
     preprocessor = DataPreprocessor(
-        captions_path=CAPTIONS_PATH,
-        images_dir=IMAGES_DIR,
-        output_dir=OUTPUT_DIR,
-        image_size=IMAGE_SIZE,
+        captions_path=str(CAPTIONS_FILE),
+        images_dir=str(IMAGES_FOLDER),
+        output_dir=str(OUTPUT_DIR),
+        image_size=IMAGE_SIZE_CFG,
         min_words=MIN_WORDS,
         train_ratio=TRAIN_RATIO,
         val_ratio=VAL_RATIO,
