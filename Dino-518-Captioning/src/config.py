@@ -80,7 +80,7 @@ MLP_HIDDEN_SIZE = 2048    # SwiGLU MLP 中间层维度 (2.67x embedding dim)
 
 # VC-BDR Loss 配置 (Visually-Constrained Batch Diversity Regularization)
 VCBDR_START_EPOCH = 2     # 从 Epoch 3 (index=2) 开始启用辅助损失
-VCBDR_WEIGHT = 5        # VC-BDR 损失权重 (lambda)
+VCBDR_WEIGHT = 50.0        # VC-BDR 损失权重 (lambda)
 
 # ============================================================
 # 5. 生成配置 (Generation Config)
