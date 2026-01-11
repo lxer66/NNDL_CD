@@ -1,4 +1,4 @@
-# DeepFashion-Captioning-Plus: 工业级服饰图像描述生成系统
+# DeepFashion-Captioning-Plus: 服饰图像与背景描述生成系统
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch 2.5](https://img.shields.io/badge/pytorch-2.5-orange.svg)](https://pytorch.org/)
