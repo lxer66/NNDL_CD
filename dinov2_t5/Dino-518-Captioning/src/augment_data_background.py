@@ -1,11 +1,11 @@
 """
-DeepFashion Data Augmentation [Final Realistic Edition]
-Hardware: NVIDIA RTX 5090 (32GB VRAM)
-Features: 
-- BiRefNet Segmentation (Fixed Memory Usage)
-- LCM-LoRA Acceleration (8 Steps)
-- Realistic Scene Prompts (In-the-wild simulation)
-- Pixel-Perfect Compositing
+DeepFashion 数据增强脚本 [实景背景合成版]
+硬件环境: NVIDIA RTX 5090 (32GB VRAM)
+核心功能: 
+1. BiRefNet 分割: 提取服装模特前景（扣图）
+2. LCM-LoRA 加速: 仅需 8 步即可生成高质量实景背景
+3. 实景提示词库: 模拟街拍、家居等多种真实场景，提升模型泛化能力
+4. 像素级合成: 前景与生成后的背景进行平滑融合
 """
 
 import argparse
@@ -56,7 +56,7 @@ BACKGROUND_OPACITY = 1.0
 
 SEED = 42
 
-# --- 真实场景提示词库 (In-the-wild Scenes) ---
+# --- 真实场景提示词库 (用于生成背景) ---
 REALISTIC_SCENES = [
     # 1. 城市/街道 (Urban/Street) - 模拟街拍
     "a busy city street sidewalk in New York, blurred cars and yellow taxis in background, daytime, natural sunlight, urban atmosphere",
