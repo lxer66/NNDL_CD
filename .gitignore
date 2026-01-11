@@ -1,6 +1,5 @@
 **/data/
 **/__pycache__/
-*.md
 **/save_checkpoint/
 **/pictures/
 .gitattributes
