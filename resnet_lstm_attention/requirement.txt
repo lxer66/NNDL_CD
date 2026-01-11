@@ -1,0 +1,24 @@
+# 深度学习基础框架 (建议根据硬件单独安装 CUDA 版本)
+torch>=2.6.0
+torchvision>=0.17.0
+
+# 图像处理与可视化
+numpy
+pillow
+matplotlib
+scikit-image
+
+# 进度条与工具
+tqdm
+
+# 自然语言处理与评估指标
+nltk
+rouge-score
+
+# 大模型与数据增强 (Qwen2-VL 相关)
+transformers>=4.37.0
+accelerate
+qwen-vl-utils
+
+# Web 前端演示
+gradio
