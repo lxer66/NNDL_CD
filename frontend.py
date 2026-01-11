@@ -241,8 +241,8 @@ with gr.Blocks(title="服装图像描述生成系统", css=custom_css) as demo:
                 
                 with gr.Accordion("项目说明", open=True):
                     gr.Markdown("""
-                    - **DINOv2-T5 (推荐)**: 采用 Meta DINOv2 视觉编码器与 Google Flan-T5 语言解码器。结合 **SwiGLU** 映射层与 **VC-BDR** 多样性损失函数，生成的描述详尽且极具语义丰富度。
-                    - **ResNet-Attention (基准)**: 经典 CNN+RNN 架构，配合自适应空间注意力机制，推理响应极快，适合对生成速度要求较高的场景。
+                    - **DINOv2-T5 (高质量)**: 采用 Meta DINOv2 视觉编码器与 Google Flan-T5 语言解码器。结合 **SwiGLU** 映射层与 **VC-BDR** 多样性损失函数，生成的描述详尽且极具语义丰富度。
+                    - **ResNet-Attention (高效率)**: 经典 CNN+RNN 架构，配合自适应空间注意力机制，推理响应极快，适合对生成速度要求较高的场景。
                     - **技术保障**: 模型基于 **DeepFashion** 数据集训练，并利用 **LCM-LoRA** 进行了实景背景合成增强，确保在真实社交与街拍环境下的描述准确性。
                     """)
 
