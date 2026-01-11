@@ -1,18 +1,32 @@
-accelerate==1.12.0
-diffusers==0.36.0
-matplotlib==3.8.4
-nltk==3.8.1
-numpy==2.4.0
-peft==0.18.0
-Pillow==12.0.0
-pycocoevalcap==1.2
-rouge_score==0.1.2
+# --- 核心深度学习框架 (Core Deep Learning) ---
 torch==2.5.1+cu121
-torchvision==0.19.0
 torchvision==0.20.1+cu121
-tqdm==4.63.0
-tqdm==4.66.4
-tqdm==4.66.5
-transformers==4.41.2
+accelerate==1.12.0
+peft==0.18.0
+timm
+einops
+kornia
+
+# --- 大模型与多模态扩展 (LLM & Multimodal) ---
 transformers==4.57.3
-transformers.egg==info
+diffusers==0.36.0
+qwen-vl-utils
+
+# --- 图像处理与可视化 (Vision & Visualization) ---
+Pillow==12.0.0
+opencv-python
+scikit-image
+scipy
+matplotlib==3.8.4
+numpy>=1.26.4
+
+# --- 实验评估与监控 (Evaluation & Monitoring) ---
+pycocoevalcap==1.2
+rouge-score==0.1.2
+nltk==3.8.1
+tqdm==4.66.5
+tensorboard
+prettytable
+
+# --- Web 前端与演示 (Frontend) ---
+gradio>=4.0.0
